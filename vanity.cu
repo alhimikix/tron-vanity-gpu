@@ -21,6 +21,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <thread>
 #include <cuda_runtime.h>
 #ifdef _WIN32
 #include <windows.h>
@@ -731,6 +732,12 @@ struct Pattern { char pre[35]; char suf[35]; u8 plen, slen; };
 __device__ __constant__ Pattern c_pats[MAX_PATTERNS];
 __device__ __constant__ int c_npats, c_icase, c_need_ck, c_nranges;
 __device__ __constant__ u32 c_bitmap[8];
+// Checksum skip for suffixes of one length K >= 6: N = A * 2^32 + ck, so the suffix fixes
+// ck = (t - A * 2^32) mod 58^K, which is usually >= 2^32: then no checksum can match and the double
+// SHA-256 is not needed. c_cw[j] = 2^(32 * (6 - j)) mod m for the address words, m = 58^K.
+#define MAX_SKIP_TARGETS 128
+__device__ __constant__ int c_skip, c_ntarget;
+__device__ __constant__ u64 c_mod, c_r64, c_cw[6], c_target[MAX_SKIP_TARGETS];
 __device__ __constant__ u64 c_rlo[MAX_RANGES], c_rhi[MAX_RANGES];
 __device__ __constant__ char c_b58[59] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 __device__ __constant__ u32 c_G[GRP + 1][16];       // j*G (j = 1..GRP) and STEP*G, affine x[8] y[8]
@@ -770,69 +777,37 @@ struct SearchParams {
     u32 chunks;        // random starts per thread per launch
     Match *m; u32 *nm; u32 mcap;
     u8 *dump;          // optional: every address of the first chunk of thread 0 (selftest)
+    u64 *dump_r;       // optional: the checksum-skip residue of the same keys (selftest)
 };
 
-__device__ __forceinline__ void check_point(const SearchParams &P, fe x, fe y, u64 counter, int offset) {
-    fe_canon(x); fe_canon(y);
-    u64 s[25];
+// Double SHA-256 checksum of A = 0x41 || hash (hb = hash bytes 12..31 as big-endian words).
+__device__ __forceinline__ u32 checksum_of(const u32 hb[5]) {
+    u32 m[16];
+    m[0] = 0x41000000u | (hb[0] >> 8);
     #pragma unroll
-    for (int i = 0; i < 25; i++) s[i] = 0;
+    for (int i = 1; i < 5; i++) m[i] = (hb[i - 1] << 24) | (hb[i] >> 8);
+    m[5] = (hb[4] << 24) | 0x00800000u;
     #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        s[i] = (u64)bswap32(x[7 - 2 * i]) | ((u64)bswap32(x[6 - 2 * i]) << 32);
-        s[4 + i] = (u64)bswap32(y[7 - 2 * i]) | ((u64)bswap32(y[6 - 2 * i]) << 32);
-    }
-    s[8] = 1; s[16] = 0x8000000000000000ULL;
-    keccakf(s);
-    // address A = 0x41 || hash[12..32), as big-endian words: A word j covers bytes 4j..4j+3 of (A || ck)
-    u32 hb[5];   // hash bytes 12..31 as big-endian words
-    hb[0] = bswap32((u32)(s[1] >> 32));
-    hb[1] = bswap32((u32)s[2]); hb[2] = bswap32((u32)(s[2] >> 32));
-    hb[3] = bswap32((u32)s[3]); hb[4] = bswap32((u32)(s[3] >> 32));
-    u64 top = ((u64)0x41 << 56) | ((u64)hb[0] << 24) | (hb[1] >> 8);
-    u32 ck = 0;
-    bool have_ck = false;
-    auto checksum = [&]() {
-        u32 m[16];
-        m[0] = 0x41000000u | (hb[0] >> 8);
-        for (int i = 1; i < 5; i++) m[i] = (hb[i - 1] << 24) | (hb[i] >> 8);
-        m[5] = (hb[4] << 24) | 0x00800000u;
-        for (int i = 6; i < 15; i++) m[i] = 0;
-        m[15] = 21 * 8;
-        u32 d1[8], d2[8];
-        sha256_block(m, d1);
-        for (int i = 0; i < 8; i++) m[i] = d1[i];
-        m[8] = 0x80000000u;
-        for (int i = 9; i < 15; i++) m[i] = 0;
-        m[15] = 256;
-        sha256_block(m, d2);
-        ck = d2[0];
-        have_ck = true;
-    };
-    bool pass = false;
-    if (c_need_ck) {
-        checksum();
-        u32 low = ck & 0xff;
-        pass = (c_bitmap[low >> 5] >> (low & 31)) & 1;
-    }
-    if (!pass && c_nranges) {
-        for (int r = 0; r < c_nranges; r++) if (top >= c_rlo[r] && top <= c_rhi[r]) { pass = true; break; }
-    }
-    if (!pass && !P.dump) return;
-    if (!have_ck) checksum();
-    // N = 00 00 00 41 | h[0..20) | ck, seven big-endian words
-    u32 nw[7];
+    for (int i = 6; i < 15; i++) m[i] = 0;
+    m[15] = 21 * 8;
+    u32 d1[8], d2[8];
+    sha256_block(m, d1);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) m[i] = d1[i];
+    m[8] = 0x80000000u;
+    #pragma unroll
+    for (int i = 9; i < 15; i++) m[i] = 0;
+    m[15] = 256;
+    sha256_block(m, d2);
+    return d2[0];
+}
+
+// Exact base58 comparison of a gate survivor; records a match.
+__device__ void full_check(const SearchParams &P, const u32 hb[5], u32 ck, u64 counter, int offset) {
+    u32 nw[7];   // N = 00 00 00 41 | h[0..20) | ck, seven big-endian words
     nw[0] = 0x41;
     for (int i = 0; i < 5; i++) nw[1 + i] = hb[i];
     nw[6] = ck;
-    if (P.dump) {
-        int idx = offset + GRP;
-        u8 *o = P.dump + (size_t)idx * 25;
-        o[0] = 0x41;
-        for (int i = 0; i < 20; i++) o[1 + i] = (u8)(hb[i >> 2] >> (24 - 8 * (i & 3)));
-        for (int i = 0; i < 4; i++) o[21 + i] = (u8)(ck >> (24 - 8 * i));
-        if (!pass) return;
-    }
     char str[40];
     int len = b58_addr(nw, str, c_b58);
     for (int p = 0; p < c_npats; p++) {
@@ -847,6 +822,108 @@ __device__ __forceinline__ void check_point(const SearchParams &P, fe x, fe y, u
         }
         return;
     }
+}
+
+// Keys that still need the checksum in skip mode wait in a per-warp queue and are processed 32 at a time,
+// so the double SHA-256 always runs with every lane busy.
+#define QCAP 64
+struct WarpQueue { u32 hb[5][QCAP]; u32 off[QCAP]; u64 ctr[QCAP]; };
+
+__device__ __forceinline__ void queue_flush(const SearchParams &P, WarpQueue &q, int &qn, int n) {
+    const int lane = threadIdx.x & 31;
+    __syncwarp(__activemask());
+    if (lane < n) {
+        int e = qn - n + lane;
+        u32 hb[5];
+        for (int i = 0; i < 5; i++) hb[i] = q.hb[i][e];
+        full_check(P, hb, checksum_of(hb), q.ctr[e], (int)q.off[e]);
+    }
+    qn -= n;
+    __syncwarp(__activemask());
+}
+
+__device__ __forceinline__ void check_point(const SearchParams &P, fe x, fe y, u64 counter, int offset, WarpQueue &q, int &qn) {
+    fe_canon(x); fe_canon(y);
+    u64 s[25];
+    #pragma unroll
+    for (int i = 0; i < 25; i++) s[i] = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        s[i] = (u64)bswap32(x[7 - 2 * i]) | ((u64)bswap32(x[6 - 2 * i]) << 32);
+        s[4 + i] = (u64)bswap32(y[7 - 2 * i]) | ((u64)bswap32(y[6 - 2 * i]) << 32);
+    }
+    s[8] = 1; s[16] = 0x8000000000000000ULL;
+    keccakf(s);
+    u32 hb[5];   // hash bytes 12..31 as big-endian words
+    hb[0] = bswap32((u32)(s[1] >> 32));
+    hb[1] = bswap32((u32)s[2]); hb[2] = bswap32((u32)(s[2] >> 32));
+    hb[3] = bswap32((u32)s[3]); hb[4] = bswap32((u32)(s[3] >> 32));
+    const u64 top = ((u64)0x41 << 56) | ((u64)hb[0] << 24) | (hb[1] >> 8);
+    bool in_range = false;
+    for (int r = 0; r < c_nranges; r++) if (top >= c_rlo[r] && top <= c_rhi[r]) { in_range = true; break; }
+
+    if (c_skip) {
+        // r = (A * 2^32) mod m from the six address words; 128-bit accumulate, then fold the high part
+        const u32 aw[6] = { 0x41u, hb[0], hb[1], hb[2], hb[3], hb[4] };
+        u64 lo = 0, hi = 0;
+        #pragma unroll
+        for (int j = 0; j < 6; j++) {
+            u64 pl = (u64)aw[j] * c_cw[j], ph = __umul64hi((u64)aw[j], c_cw[j]);
+            lo += pl; hi += ph + (lo < pl);
+        }
+        while (hi) {
+            u64 pl = hi * c_r64, ph = __umul64hi(hi, c_r64);
+            lo += pl; hi = ph + (lo < pl);
+        }
+        const u64 m = c_mod, r = lo % m;
+        bool want = false;
+        for (int v = 0; v < c_ntarget; v++) {
+            u64 t = c_target[v];
+            want |= (t >= r ? t - r : t + (m - r)) < 0x100000000ULL;
+        }
+        if (P.dump) {   // selftest: residue and full address of every key
+            P.dump_r[offset + GRP] = r;
+            u32 ck = checksum_of(hb);
+            u8 *o = P.dump + (size_t)(offset + GRP) * 25;
+            o[0] = 0x41;
+            for (int i = 0; i < 20; i++) o[1 + i] = (u8)(hb[i >> 2] >> (24 - 8 * (i & 3)));
+            for (int i = 0; i < 4; i++) o[21 + i] = (u8)(ck >> (24 - 8 * i));
+            if (want || in_range) full_check(P, hb, ck, counter, offset);
+            return;
+        }
+        if (in_range) { full_check(P, hb, checksum_of(hb), counter, offset); want = false; }
+        const unsigned act = __activemask();
+        const unsigned mask = __ballot_sync(act, want);
+        if (mask) {
+            const int lane = threadIdx.x & 31;
+            if (want) {
+                int e = qn + __popc(mask & ((1u << lane) - 1));
+                for (int i = 0; i < 5; i++) q.hb[i][e] = hb[i];
+                q.off[e] = (u32)offset; q.ctr[e] = counter;
+            }
+            qn += __popc(mask);
+            if (qn >= 32) queue_flush(P, q, qn, 32);
+        }
+        return;
+    }
+
+    u32 ck = 0;
+    bool pass = in_range, have = false;
+    if (c_need_ck) {
+        ck = checksum_of(hb); have = true;
+        u32 low = ck & 0xff;
+        pass |= (c_bitmap[low >> 5] >> (low & 31)) & 1;
+    }
+    if (P.dump) {
+        if (!have) ck = checksum_of(hb);
+        have = true;
+        u8 *o = P.dump + (size_t)(offset + GRP) * 25;
+        o[0] = 0x41;
+        for (int i = 0; i < 20; i++) o[1 + i] = (u8)(hb[i >> 2] >> (24 - 8 * (i & 3)));
+        for (int i = 0; i < 4; i++) o[21 + i] = (u8)(ck >> (24 - 8 * i));
+    }
+    if (!pass) return;
+    full_check(P, hb, have ? ck : checksum_of(hb), counter, offset);
 }
 
 // P (Jacobian) += Q (affine); P must not be infinity and P != +-Q
@@ -866,6 +943,9 @@ __device__ __forceinline__ void jac_madd(fe X, fe Y, fe Z, const u32 *qx, const 
 
 __global__ void __launch_bounds__(THREADS) k_search(SearchParams P) {
     const u32 gid = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ WarpQueue s_queue[THREADS / 32];
+    WarpQueue &q = s_queue[threadIdx.x >> 5];
+    int qn = 0;   // queue length, identical in every lane of the warp
     for (u32 ch = 0; ch < P.chunks; ch++) {
         u64 counter = P.base + (u64)gid * P.chunks + ch;
         u32 w[8], k[8];
@@ -890,7 +970,7 @@ __global__ void __launch_bounds__(THREADS) k_search(SearchParams P) {
         fe pre[GRP + 1];
         for (int r = 0; r < ROUNDS; r++) {
             int base_off = r * STEP;
-            { fe cx, cy; fe_copy(cx, x); fe_copy(cy, y); check_point(P, cx, cy, counter, base_off); }
+            { fe cx, cy; fe_copy(cx, x); fe_copy(cy, y); check_point(P, cx, cy, counter, base_off, q, qn); }
             // prefix products of dx_j = x(jG) - x
             for (int j = 0; j <= GRP; j++) {
                 fe dx;
@@ -911,16 +991,17 @@ __global__ void __launch_bounds__(THREADS) k_search(SearchParams P) {
                 fe_sq(x3, l); fe_sub(x3, x3, x); fe_sub(x3, x3, gx);
                 fe_sub(t, x, x3); fe_mul(y3, l, t); fe_sub(y3, y3, y);
                 if (j == GRP) { fe_copy(nx, x3); fe_copy(ny, y3); continue; }   // next centre = P + STEP*G
-                check_point(P, x3, y3, counter, base_off + j + 1);
+                check_point(P, x3, y3, counter, base_off + j + 1, q, qn);
                 // P - jG: slope -(gy + y) * ij
                 fe_add(l, gy, y); fe_mul(l, l, ij);
                 fe_sq(x3, l); fe_sub(x3, x3, x); fe_sub(x3, x3, gx);
                 fe_sub(t, x3, x); fe_mul(y3, l, t); fe_sub(y3, y3, y);
-                check_point(P, x3, y3, counter, base_off - (j + 1));
+                check_point(P, x3, y3, counter, base_off - (j + 1), q, qn);
             }
             fe_copy(x, nx); fe_copy(y, ny);
         }
     }
+    if (qn) queue_flush(P, q, qn, qn);
 }
 
 // ============================================================================
@@ -992,7 +1073,47 @@ static HPt hG() {
     memcpy(g.x, gx, 32); memcpy(g.y, gy, 32);
     return g;
 }
+// k*G: Jacobian accumulation over a table of 2^i * G (affine), one inversion at the end.
+static std::vector<HPt> g_pow2;
 static HPt hmulG(const u32 *k) {
+    if (g_pow2.empty()) {
+        HPt d = hG();
+        for (int i = 0; i < 256; i++) { g_pow2.push_back(d); d = hadd(d, d); }
+    }
+    u32 X[8], Y[8], Z[8];
+    bool inf = true;
+    for (int i = 0; i < 256; i++) {
+        if (!((k[i >> 5] >> (i & 31)) & 1)) continue;
+        const HPt &q = g_pow2[i];
+        if (inf) { memcpy(X, q.x, 32); memcpy(Y, q.y, 32); memset(Z, 0, 32); Z[0] = 1; inf = false; continue; }
+        u32 z2[8], u2[8], s2[8], h[8], r[8], h2[8], h3[8], v[8], t[8];
+        hmulp(z2, Z, Z); hmulp(u2, q.x, z2); hmulp(s2, q.y, z2); hmulp(s2, s2, Z);
+        hsubm(h, u2, X, HP); hsubm(r, s2, Y, HP);
+        bool hz = true, rz = true;
+        for (int w = 0; w < 8; w++) { hz &= h[w] == 0; rz &= r[w] == 0; }
+        if (hz) {   // same x: doubling or opposite points -- fall back to the affine reference
+            HPt acc; acc.inf = false; u32 zi[8], zi2[8];
+            hinvp(zi, Z); hmulp(zi2, zi, zi); hmulp(acc.x, X, zi2); hmulp(zi2, zi2, zi); hmulp(acc.y, Y, zi2);
+            acc = hadd(acc, q);
+            if (acc.inf) { inf = true; continue; }
+            memcpy(X, acc.x, 32); memcpy(Y, acc.y, 32); memset(Z, 0, 32); Z[0] = 1;
+            (void)rz;
+            continue;
+        }
+        hmulp(h2, h, h); hmulp(h3, h, h2); hmulp(v, X, h2);
+        hmulp(t, r, r); hsubm(t, t, h3, HP); hsubm(t, t, v, HP); hsubm(X, t, v, HP);
+        hsubm(t, v, X, HP); hmulp(t, r, t); hmulp(h3, Y, h3); hsubm(Y, t, h3, HP);
+        hmulp(Z, Z, h);
+    }
+    HPt out; out.inf = inf;
+    if (!inf) {
+        u32 zi[8], zi2[8];
+        hinvp(zi, Z); hmulp(zi2, zi, zi); hmulp(out.x, X, zi2); hmulp(zi2, zi2, zi); hmulp(out.y, Y, zi2);
+    }
+    return out;
+}
+// The plain double-and-add reference, used by the selftest to check the fast path above.
+static HPt hmulG_slow(const u32 *k) {
     HPt r; r.inf = true; HPt q = hG();
     for (int i = 0; i < 256; i++) { if ((k[i >> 5] >> (i & 31)) & 1) r = hadd(r, q); q = hadd(q, q); }
     return r;
@@ -1130,7 +1251,29 @@ struct PatternSet {
     u32 bitmap[8] = {0};
     std::vector<Range> ranges;
     double prob = 0;
+    // checksum skip (see c_skip): suffix values of one length K, with their residues mod 58^K
+    bool skip = false; int skipK = 0; u64 mod = 0, r64 = 0, cw[6] = {0};
+    std::vector<u64> targets; std::vector<int> suffix_len;
 };
+static u64 mulmod64(u64 a, u64 b, u64 m) {   // a, b < m < 2^63
+    u64 r = 0; a %= m;
+    while (b) { if (b & 1) { r += a; if (r >= m) r -= m; } a += a; if (a >= m) a -= m; b >>= 1; }
+    return r;
+}
+static u64 pow2mod(int e, u64 m) { u64 r = 1 % m; for (int i = 0; i < e; i++) { r += r; if (r >= m) r -= m; } return r; }
+// Turn the checksum skip on when every suffix has the same length K in 6..10 and few enough values.
+static void plan_skip(PatternSet &ps) {
+    if (ps.targets.empty()) return;
+    int K = ps.suffix_len[0];
+    for (int k : ps.suffix_len) if (k != K) return;
+    if (K < 6 || K > 10 || ps.targets.size() > MAX_SKIP_TARGETS) return;
+    double pass = (double)ps.targets.size() * 4294967296.0 / pow(58.0, K);
+    if (pass > 0.5) return;
+    u64 m = 1; for (int i = 0; i < K; i++) m *= 58;
+    ps.skip = true; ps.skipK = K; ps.mod = m; ps.need_ck = false;
+    ps.r64 = pow2mod(64, m);
+    for (int j = 0; j < 6; j++) ps.cw[j] = pow2mod(32 * (6 - j), m);
+}
 // Address integer N is 25 bytes, always in [0x41 * 2^192, 0x42 * 2^192) -> 34 base58 characters.
 static bool build_patterns(PatternSet &ps, const std::vector<std::pair<std::string, std::string>> &in) {
     Big lo0, hi0;
@@ -1180,8 +1323,10 @@ static bool build_patterns(PatternSet &ps, const std::vector<std::pair<std::stri
             ps.need_ck = true;
             int K = (int)suf.size();
             psuf = (double)sv.size() * pow(58.0, -K);
+            ps.suffix_len.push_back(K);
             for (auto &v : sv) {
                 Big x; for (char c : v) x.mul_add(58, (u32)b58_index(c));
+                if (K <= 10) ps.targets.push_back(((u64)x.w[1] << 32) | x.w[0]);
                 u32 low = x.w[0] & 0xff; int kb = K < 8 ? K : 8; u32 m = (1u << kb) - 1;
                 for (u32 b = 0; b < 256; b++) if ((b & m) == (low & m)) ps.bitmap[b >> 5] |= 1u << (b & 31);
             }
@@ -1200,6 +1345,7 @@ static bool build_patterns(PatternSet &ps, const std::vector<std::pair<std::stri
         merged[best].hi = merged[best + 1].hi; merged.erase(merged.begin() + best + 1);
     }
     ps.ranges = merged;
+    plan_skip(ps);
     return true;
 }
 static bool host_match(const PatternSet &ps, const std::string &s) {
@@ -1221,6 +1367,7 @@ static void os_random(void *buf, size_t n) {
 // Host: device setup and the search loop
 // ============================================================================
 static void upload_tables() {
+    { u32 one[8] = {1, 0, 0, 0, 0, 0, 0, 0}; hmulG(one); }   // builds the host 2^i * G table before any threads
     std::vector<u32> g((GRP + 1) * 16), p2(256 * 16);
     HPt G = hG(), acc = G;
     for (int j = 1; j <= GRP; j++) {
@@ -1247,6 +1394,15 @@ static void upload_patterns(const PatternSet &ps) {
     CUDA_CHECK(cudaMemcpyToSymbol(c_bitmap, ps.bitmap, 32));
     CUDA_CHECK(cudaMemcpyToSymbol(c_rlo, lo.data(), 8 * MAX_RANGES));
     CUDA_CHECK(cudaMemcpyToSymbol(c_rhi, hi.data(), 8 * MAX_RANGES));
+    int sk = ps.skip, nt = ps.skip ? (int)ps.targets.size() : 0;
+    std::vector<u64> tg(MAX_SKIP_TARGETS, 0);
+    for (int i = 0; i < nt; i++) tg[i] = ps.targets[i];
+    CUDA_CHECK(cudaMemcpyToSymbol(c_skip, &sk, 4));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_ntarget, &nt, 4));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_mod, &ps.mod, 8));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_r64, &ps.r64, 8));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_cw, ps.cw, 8 * 6));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_target, tg.data(), 8 * MAX_SKIP_TARGETS));
 }
 
 struct Options {
@@ -1257,17 +1413,34 @@ struct Options {
 struct Stats { u64 found = 0, keys = 0, mismatch = 0, dropped = 0; };
 
 static void process(const PatternSet &ps, const u32 key[8], const Match *m, u32 n, FILE *csv, Stats &st, long long limit, bool quiet) {
-    for (u32 i = 0; i < n; i++) {
-        if (limit > 0 && (long long)st.found >= limit) return;
-        u32 k[8]; u8 addr[25];
-        key_of(key, m[i].counter, m[i].offset, k);
-        ref_address(k, addr);
-        std::string a = b58_bytes(addr, 25);
-        if (memcmp(addr, m[i].addr, 25) != 0 || !host_match(ps, a)) { st.mismatch++; continue; }
-        if (csv) { fprintf(csv, "%s,%s\n", a.c_str(), key_hex(k).c_str()); fflush(csv); }
-        st.found++;
-        if (!quiet) { printf("Found #%llu: %s\n", (unsigned long long)st.found, a.c_str()); fflush(stdout); }
+    if (limit > 0) n = (u32)std::min<long long>(n, std::max<long long>(0, limit - (long long)st.found));
+    struct Out { bool ok; std::string addr, key; };
+    std::vector<Out> out(n);
+    auto work = [&](u32 from, u32 step) {
+        for (u32 i = from; i < n; i += step) {
+            u32 k[8]; u8 addr[25];
+            key_of(key, m[i].counter, m[i].offset, k);
+            ref_address(k, addr);
+            out[i].addr = b58_bytes(addr, 25);
+            out[i].ok = memcmp(addr, m[i].addr, 25) == 0 && host_match(ps, out[i].addr);
+            out[i].key = key_hex(k);
+        }
+    };
+    unsigned nt = std::min<unsigned>(std::max(1u, std::thread::hardware_concurrency()), (n + 7) / 8);
+    if (nt <= 1) work(0, 1);
+    else {
+        std::vector<std::thread> th;
+        for (unsigned t = 0; t < nt; t++) th.emplace_back(work, t, nt);
+        for (auto &x : th) x.join();
     }
+    for (auto &o : out) {
+        if (!o.ok) { st.mismatch++; continue; }
+        if (csv) fprintf(csv, "%s,%s\n", o.addr.c_str(), o.key.c_str());
+        st.found++;
+        if (!quiet) printf("Found #%llu: %s\n", (unsigned long long)st.found, o.addr.c_str());
+    }
+    if (csv) fflush(csv);
+    fflush(stdout);
 }
 
 static int selftest(const Options &o) {
@@ -1276,6 +1449,14 @@ static int selftest(const Options &o) {
         u32 k[8] = {1, 0, 0, 0, 0, 0, 0, 0}; u8 a[25];
         ref_address(k, a);
         bool ok = b58_bytes(a, 25) == "TMVQGm1qAQYVdetCeGRRkTWYYrLXuHK2HC";
+        int fbad = 0;   // fast Jacobian k*G against the plain double-and-add, random keys
+        for (int t = 0; t < 24; t++) {
+            u32 r[8], kk[8]; os_random(r, 32); scalar_from_words(kk, r);
+            HPt a1 = hmulG(kk), a2 = hmulG_slow(kk);
+            fbad += memcmp(a1.x, a2.x, 32) != 0 || memcmp(a1.y, a2.y, 32) != 0;
+        }
+        printf("[%s] host fast k*G vs double-and-add (24 keys, %d bad)\n", fbad ? "FAIL" : " ok ", fbad);
+        fails += fbad != 0;
         printf("[%s] host reference: key 1 -> %s\n", ok ? " ok " : "FAIL", b58_bytes(a, 25).c_str());
         fails += !ok;
     }
@@ -1283,7 +1464,7 @@ static int selftest(const Options &o) {
     build_patterns(ps, { {"", "Ab"}, {"TL", ""}, {"", "z"}, {"TZ", "x"} });
     upload_tables(); upload_patterns(ps);
     SearchParams P; os_random(P.key, 32);
-    P.base = 0; P.chunks = 1; P.mcap = 1 << 16;
+    P.base = 0; P.chunks = 1; P.mcap = 1 << 16; P.dump_r = nullptr;
     const int nkeys = ROUNDS * STEP;
     CUDA_CHECK(cudaMalloc(&P.m, sizeof(Match) * P.mcap)); CUDA_CHECK(cudaMalloc(&P.nm, 4)); CUDA_CHECK(cudaMemset(P.nm, 0, 4));
     CUDA_CHECK(cudaMalloc(&P.dump, (size_t)(nkeys + 2 * GRP) * 25));
@@ -1310,6 +1491,30 @@ static int selftest(const Options &o) {
     bool mok = want == got;
     printf("[%s] GPU matcher vs host scan of %d keys (%zu expected, %zu found)\n", mok ? " ok " : "FAIL", nkeys, want.size(), got.size());
     fails += !mok;
+    {   // checksum skip: GPU residue (A * 2^32) mod 58^6 against the host, for every key of the chunk
+        PatternSet ks; ks.icase = false;
+        build_patterns(ks, { {"", "Tron88"}, {"", "zzzzzz"} });
+        bool on = ks.skip;
+        upload_patterns(ks);
+        u64 *dr; CUDA_CHECK(cudaMalloc(&dr, (size_t)(nkeys + 2 * GRP) * 8));
+        P.dump_r = dr; CUDA_CHECK(cudaMemset(P.nm, 0, 4));
+        k_search<<<1, 1>>>(P);
+        CUDA_CHECK(cudaGetLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<u64> rr(nkeys + 2 * GRP);
+        CUDA_CHECK(cudaMemcpy(rr.data(), dr, rr.size() * 8, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(dump.data(), P.dump, dump.size(), cudaMemcpyDeviceToHost));
+        int rbad = 0;
+        for (int off = -GRP; off < nkeys - GRP; off++) {
+            const u8 *a = &dump[(size_t)(off + GRP) * 25];
+            u64 r = 0;
+            for (int i = 0; i < 21; i++) r = (mulmod64(r, 256, ks.mod) + a[i]) % ks.mod;
+            r = mulmod64(r, pow2mod(32, ks.mod), ks.mod);
+            rbad += r != rr[off + GRP];
+        }
+        bool ok = on && rbad == 0;
+        printf("[%s] checksum skip residues vs host (%d keys, %d bad)\n", ok ? " ok " : "FAIL", nkeys, rbad);
+        fails += !ok;
+    }
     printf(fails ? "SELFTEST FAILED\n" : "SELFTEST PASSED\n");
     return fails ? 1 : 0;
 }
@@ -1378,7 +1583,7 @@ int main(int argc, char **argv) {
     if (!exists) fprintf(csv, "address,private_key\n");
     fflush(csv);
 
-    SearchParams P; os_random(P.key, 32); P.base = 0; P.chunks = 1; P.mcap = 1 << 16; P.dump = nullptr;
+    SearchParams P; os_random(P.key, 32); P.base = 0; P.chunks = 1; P.mcap = 1 << 16; P.dump = nullptr; P.dump_r = nullptr;
     Match *hm; u32 *hn;
     CUDA_CHECK(cudaMalloc(&P.m, sizeof(Match) * P.mcap)); CUDA_CHECK(cudaMalloc(&P.nm, 4));
     CUDA_CHECK(cudaMallocHost(&hm, sizeof(Match) * P.mcap)); CUDA_CHECK(cudaMallocHost(&hn, 4));

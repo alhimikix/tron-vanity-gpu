@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.1.0 - 2026-11-10
+
+- Suffixes of 6+ characters skip the double SHA-256 for almost every key: the needed checksum follows from the
+  address, and it is out of range for 89% (K = 6) to 99.997% (K = 8) of keys. 6 characters: 1.12 -> ~1.45 billion
+  keys/sec, 8 characters: 1.12 -> ~1.75 billion on an RTX 5080.
+- Keys that still need the checksum are queued per warp and hashed 32 at a time.
+- Host check of matches: Jacobian k*G over a 2^i table and several threads (short patterns no longer slow the
+  search down).
+- Selftest also checks the checksum-skip residues and the fast host k*G.
+
 ## v1.0.0 - 2026-11-10
 
 First release.
