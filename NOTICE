@@ -1,0 +1,10 @@
+tron-vanity-gpu
+Copyright 2026 alhimikix
+https://github.com/alhimikix/tron-vanity-gpu
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+If you redistribute it or a work based on it, keep this NOTICE file with it
+(Apache License 2.0, section 4(d)) so the original author stays credited.
+
+Third-party material:
+- The secp256k1 field inversion addition chain follows libsecp256k1 (MIT, Pieter Wuille et al.).

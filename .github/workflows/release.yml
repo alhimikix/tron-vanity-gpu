@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '12.9.1'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart"]'
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build (sm_86 — RTX 30xx)
+        shell: cmd
+        run: |
+          nvcc -O3 -arch=sm_86 -allow-unsupported-compiler -Xcompiler "/O2 /MD" -o tron_vanity_sm86.exe vanity.cu
+
+      - name: Build (sm_89 — RTX 40xx)
+        shell: cmd
+        run: |
+          nvcc -O3 -arch=sm_89 -allow-unsupported-compiler -Xcompiler "/O2 /MD" -o tron_vanity_sm89.exe vanity.cu
+
+      - name: Build (sm_75 — RTX 20xx / GTX 16xx)
+        shell: cmd
+        run: |
+          nvcc -O3 -arch=sm_75 -allow-unsupported-compiler -Xcompiler "/O2 /MD" -o tron_vanity_sm75.exe vanity.cu
+
+      - name: Build (sm_120 — RTX 50xx)
+        shell: cmd
+        run: |
+          nvcc -O3 -arch=sm_120 -allow-unsupported-compiler -Xcompiler "/O2 /MD" -o tron_vanity_sm120.exe vanity.cu
+
+      - name: Package Windows release
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force -Path release-win
+          Copy-Item tron_vanity_sm75.exe, tron_vanity_sm86.exe, tron_vanity_sm89.exe, tron_vanity_sm120.exe release-win/
+          Copy-Item README.md, LICENSE, NOTICE, CHANGELOG.md release-win/
+          Compress-Archive -Path release-win/* -DestinationPath "tron-vanity-gpu-$version-windows-x64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: tron-vanity-gpu-*-windows-x64.zip
+
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '12.9.1'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart"]'
+
+      - name: Build (sm_86)
+        run: nvcc -O3 -arch=sm_86 -Xcompiler -pthread -o tron_vanity_sm86 vanity.cu
+
+      - name: Build (sm_89)
+        run: nvcc -O3 -arch=sm_89 -Xcompiler -pthread -o tron_vanity_sm89 vanity.cu
+
+      - name: Build (sm_75)
+        run: nvcc -O3 -arch=sm_75 -Xcompiler -pthread -o tron_vanity_sm75 vanity.cu
+
+      - name: Build (sm_120)
+        run: nvcc -O3 -arch=sm_120 -Xcompiler -pthread -o tron_vanity_sm120 vanity.cu
+
+      - name: Package Linux release
+        run: |
+          version="${{ github.ref_name }}"
+          mkdir -p release-linux
+          cp tron_vanity_sm75 tron_vanity_sm86 tron_vanity_sm89 tron_vanity_sm120 release-linux/
+          cp README.md LICENSE NOTICE CHANGELOG.md release-linux/
+          tar -czf "tron-vanity-gpu-${version}-linux-x64.tar.gz" -C release-linux .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: tron-vanity-gpu-*-linux-x64.tar.gz
+
+  release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Extract changelog for this release
+        id: changelog
+        run: |
+          version="${{ github.ref_name }}"
+          version_no_v="${version#v}"
+          # Extract section between current version header and next ## header
+          awk -v ver="$version_no_v" '
+            /^## v/ { if (found) exit; if ($2 == "v" ver || $2 == ver) found=1; next }
+            found { print }
+          ' CHANGELOG.md > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "Release ${version}" > release_notes.md
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/windows-release/*.zip
+            artifacts/linux-release/*.tar.gz
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
