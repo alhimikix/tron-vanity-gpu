@@ -1,5 +1,14 @@
 # Changelog
 
+## Browser version - 2026-11-10
+
+- WebGPU page (`web/`, https://alhimikix.github.io/tron-vanity-gpu/): prefix, suffix or both on the GPU of any
+  device with WebGPU; ~840M keys/sec on an RTX 5080 in Chrome (prefixes, suffixes of 6+ characters), ~360M for
+  shorter suffixes.
+- secp256k1 field on 20 x 13-bit limbs in WGSL (`tools/gen_wgsl_secp.py`), Keccak-256 and double SHA-256 on the
+  GPU, checksum skip with a per-thread queue.
+- Every match re-checked with a BigInt reference before it is shown; in-page selftest; CSV/JSON export.
+
 ## v1.1.0 - 2026-11-10
 
 - Suffixes of 6+ characters skip the double SHA-256 for almost every key: the needed checksum follows from the

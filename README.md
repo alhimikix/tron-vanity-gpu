@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.png" alt="tron-vanity-gpu — Tron vanity addresses at GPU speed" width="860"></p>
+
 # tron-vanity-gpu
 
 GPU generator for Tron vanity addresses. Pick how the address starts, ends, or both — `TAnton…`, `…pump`,
@@ -6,6 +8,12 @@ GPU generator for Tron vanity addresses. Pick how the address starts, ends, or b
 **Up to ~1.8 billion keys/sec on an RTX 5080**: ~1.8 billion for prefixes, 1.4–1.75 billion for suffixes of
 6+ characters, ~1.1 billion for short suffixes.
 Keys are standard secp256k1 private keys and import into TronLink and other Tron wallets.
+
+**Try it in the browser:** https://alhimikix.github.io/tron-vanity-gpu/ — the same pipeline ported to WebGPU
+(~840M keys/sec on an RTX 5080 in Chrome for prefixes and 6+ character suffixes, ~360M for short suffixes).
+Keys are generated and checked on the page only.
+
+<p align="center"><a href="https://alhimikix.github.io/tron-vanity-gpu/"><img src="assets/screenshot.png" alt="The browser version: one terminal window, prefix/suffix search on the GPU" width="900"></a></p>
 
 ## Usage
 
@@ -78,6 +86,17 @@ Build from source (CUDA ≥ 12.0, ≥ 12.8 for RTX 50xx; MSVC on Windows, GCC on
    need it wait in a per-warp queue and are hashed 32 at a time with every lane busy.
 5. **Check.** Every match is recomputed on the CPU with an independent implementation (plain modular arithmetic,
    Keccak, SHA-256) before it is written. `tools/tron_ref.py --verify file.csv` re-checks a CSV in pure Python.
+
+## Browser version (`web/`)
+
+A static page that runs the same search on the GPU through WebGPU: ChaCha12 random starts, batched affine
+additions with one inversion per 65 keys, Keccak-256 and double SHA-256 in WGSL, and the checksum skip for
+suffixes of 6+ characters (the residue comes from a per-byte table, and keys that still need the checksum are
+queued per thread and hashed at the end of each round). The field arithmetic runs on 20 × 13-bit limbs, because
+WGSL has no 64-bit integers or high multiply; `tools/gen_wgsl_secp.py` generates it. Every match is recomputed
+with a plain BigInt secp256k1, Keccak and SHA-256 before it is shown, and the page makes no network requests
+after loading. It is deployed to GitHub Pages by `.github/workflows/pages.yml`. To run it locally:
+`python -m http.server -d web` and open http://localhost:8000.
 
 ## Security
 

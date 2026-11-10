@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>tron-vanity-gpu — Tron vanity addresses at GPU speed</title>
+<meta name="description" content="Generate Tron (TRX) vanity addresses on your GPU: prefix, suffix or both. Native CUDA up to ~1.8 billion keys/s, in the browser with WebGPU. Keys never leave your machine.">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta property="og:type" content="website">
+<meta property="og:title" content="tron-vanity-gpu — Tron vanity addresses at GPU speed">
+<meta property="og:description" content="Prefix, suffix or both. Runs on your GPU right in the browser (WebGPU) — keys never leave the page. Native CUDA app: up to ~1.8 billion keys/sec.">
+<meta property="og:url" content="https://alhimikix.github.io/tron-vanity-gpu/">
+<meta property="og:image" content="https://alhimikix.github.io/tron-vanity-gpu/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/png" href="icon-512.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="term">
+  <div class="bar">
+    <i></i><i></i><i></i>
+    <span id="gputitle" class="title">tron-vanity-gpu v1.1.0 — ~&#92;tron</span>
+    <a class="gh" href="https://github.com/alhimikix/tron-vanity-gpu">github ↗</a>
+  </div>
+
+  <div id="screen" class="screen">
+    <div id="log" class="log"></div>
+    <div id="progress"></div>
+  </div>
+
+  <form id="form" class="prompt" autocomplete="off">
+    <span class="ps">PS ~&#92;tron&gt;</span>
+    <span>tron_vanity</span>
+    <label><span class="flag">-p</span><input id="prefix" placeholder="prefix" maxlength="12" spellcheck="false"></label>
+    <label><span class="flag">-s</span><input id="suffix" placeholder="suffix" maxlength="12" spellcheck="false"></label>
+    <label><span class="flag">-n</span><select id="count"><option>1</option><option>3</option><option selected>5</option><option>10</option><option value="0">∞</option></select></label>
+    <label class="chk"><input type="checkbox" id="icase"><span class="flag">-i</span><span class="dim">any case</span></label>
+    <button id="start" type="submit">⏎ run</button>
+    <button id="stop" type="button" disabled>■ stop</button>
+    <div id="hint" class="dim"></div>
+  </form>
+  <nav class="keys">
+    <button type="button" data-cmd="about"><kbd>1</kbd>about</button>
+    <button type="button" data-cmd="download" class="hot"><kbd>2</kbd>download app</button>
+    <button type="button" data-cmd="how"><kbd>3</kbd>how it works</button>
+    <button type="button" data-cmd="selftest"><kbd>4</kbd>selftest</button>
+    <button type="button" data-cmd="save" class="hot"><kbd>5</kbd>save all</button>
+    <button type="button" data-cmd="clear"><kbd>6</kbd>clear</button>
+    <a href="https://github.com/alhimikix/tron-vanity-gpu"><kbd>7</kbd>github</a>
+  </nav>
+</div>
+
+<template id="t-about">
+<pre class="logo" aria-label="tron">████████╗██████╗  ██████╗ ███╗   ██╗
+╚══██╔══╝██╔══██╗██╔═══██╗████╗  ██║
+   ██║   ██████╔╝██║   ██║██╔██╗ ██║
+   ██║   ██╔══██╗██║   ██║██║╚██╗██║
+   ██║   ██║  ██║╚██████╔╝██║ ╚████║
+   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝</pre>
+<div><b>Tron vanity addresses at <span class="g">GPU speed</span></b></div>
+<div class="dim">Pick how your address starts (-p), ends (-s), or both, and hit run. It runs on your graphics card;</div>
+<div class="dim">keys are created and checked on this page only — nothing is sent anywhere.</div>
+<div class="sp"></div>
+<div class="dim"># keys/sec for a prefix or a 6+ character suffix. RTX 5080 rows are reference numbers, not your device:</div>
+<div class="bars-slot"></div>
+<div><button type="button" class="act big" data-cmd="bench">[ ▶ measure my device ]</button> <span class="dim">~10 s, shows the real speed and wait times on this phone / PC</span></div>
+<div class="sp"></div>
+<div class="dim">try: <a href="#" data-try="pump|">-s pump</a> · <a href="#" data-try="|Anton">-p Anton</a> · <a href="#" data-try="777|Sun|i">-p Sun -s 777 -i</a></div>
+</template>
+
+<template id="t-download">
+<div class="dim">Native app: ~2–3× faster than the browser, runs in the background, several patterns at once.</div>
+<div>  <a href="https://github.com/alhimikix/tron-vanity-gpu/releases/download/v1.1.0/tron-vanity-gpu-v1.1.0-windows-x64.zip">↓ tron-vanity-gpu-v1.1.0-windows-x64.zip</a></div>
+<div>  <a href="https://github.com/alhimikix/tron-vanity-gpu/releases/download/v1.1.0/tron-vanity-gpu-v1.1.0-linux-x64.tar.gz">↓ tron-vanity-gpu-v1.1.0-linux-x64.tar.gz</a></div>
+<div>  <a href="https://github.com/alhimikix/tron-vanity-gpu/releases">→ all releases</a></div>
+<div class="dim"># NVIDIA RTX 20xx or newer. One binary per GPU: sm75 RTX 20xx/GTX 16xx · sm86 RTX 30xx · sm89 RTX 40xx · sm120 RTX 50xx</div>
+<pre><span class="txt">  tron_vanity_sm120.exe -s pump -n 10</span>        <span class="dim"># ends with pump, 10 addresses</span>
+<span class="txt">  tron_vanity_sm120.exe -p Anton -n 1</span>        <span class="dim"># starts with TAnton</span>
+<span class="txt">  tron_vanity_sm120.exe -m "TSun*777" -i</span>     <span class="dim"># TSun… and …777, any case</span>
+<span class="txt">  tron_vanity_sm120.exe --selftest</span>           <span class="dim"># check the GPU against the reference</span></pre>
+</template>
+
+<template id="t-how">
+<pre><span class="c">starts   </span><span class="dim">a random 32-byte key from your crypto RNG feeds ChaCha12; each GPU thread takes one block
+         as a private key k and computes k·G once</span>
+<span class="c">keys     </span><span class="dim">then it walks k ± j with affine additions of precomputed j·G: 65 keys share one field
+         inversion (Montgomery's trick); after 4160 keys it takes a fresh random start</span>
+<span class="c">address  </span><span class="dim">Keccak-256(X‖Y) → 0x41 ‖ last 20 bytes → double SHA-256 checksum → base58, all on the GPU</span>
+<span class="c">matching </span><span class="dim">prefixes are filtered on the top bits; for a suffix of 6+ characters the needed checksum
+         follows from the address, so the double SHA-256 is skipped for almost every key</span>
+<span class="c">checking </span><span class="dim">every match is recomputed with a separate, plain secp256k1 before it is shown</span>
+<span class="c">odds     </span><span class="dim">each extra character is ~58× rarer; every address starts with T and the second character
+         is one of A–Z (no I, O); -i (any case) helps a lot</span>
+<span class="c">import   </span><span class="dim">TronLink → Import wallet → Private key (64 hex characters)</span>
+<span class="c">safety   </span><span class="dim">for an address that will hold real money, use the native app on an offline machine</span>
+<span class="c">license  </span><span class="dim">Apache 2.0 · © 2026 alhimikix</span></pre>
+</template>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
